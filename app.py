@@ -7,9 +7,9 @@ import base64
 import logging
 import requests
 import threading
-import cloudscraper
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import sync_playwright
 
 from flask import Flask, render_template, request, jsonify, send_file, abort
 from bs4 import BeautifulSoup
@@ -22,6 +22,9 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Render deployment compatibility
+os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '0')
+
 TEMP_DIR = os.path.join(os.path.dirname(__file__), 'temp')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -29,55 +32,54 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BROWSER_HEADERS = {
     'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'Mozilla/5.0 (Linux; Android 13; SM-G991B) '
         'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/120.0.0.0 Safari/537.36'
+        'Chrome/120.0.0.0 Mobile Safari/537.36'
     ),
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5',
     'Connection': 'keep-alive',
 }
 
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 40000  # Playwright uses milliseconds
 DEFAULT_RETRIES = 3
 
 
-def get_session(referer=None):
-    session = cloudscraper.create_scraper()
-    headers = dict(BROWSER_HEADERS)
-    if referer:
-        headers['Referer'] = referer
-    session.headers.update(headers)
-    return session
-
-
-def fetch_response(session, method, url, headers=None, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, allow_redirects=True, **kwargs):
+def fetch_page_with_playwright(url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES):
+    """
+    Fetch page HTML using Playwright Chromium browser.
+    Handles Cloudflare and JavaScript-rendered content.
+    Returns (html_content, final_url) or raises exception after retries.
+    """
     for attempt in range(1, retries + 1):
         try:
-            request_headers = dict(headers or {})
-            if 'Referer' in session.headers and 'Referer' not in request_headers:
-                request_headers['Referer'] = session.headers['Referer']
-            response = getattr(session, method)(
-                url,
-                headers=request_headers,
-                timeout=timeout,
-                allow_redirects=allow_redirects,
-                **kwargs,
-            )
-
-            if response.status_code in (403, 429, 500, 502, 503, 504):
-                raise requests.exceptions.HTTPError(
-                    f'Retryable status code {response.status_code}', response=response
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=BROWSER_HEADERS['User-Agent'],
+                    extra_http_headers={
+                        'Accept': BROWSER_HEADERS['Accept'],
+                        'Accept-Language': BROWSER_HEADERS['Accept-Language'],
+                    },
+                    viewport={'width': 1280, 'height': 720},
                 )
-
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as exc:
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until='networkidle', timeout=timeout)
+                    html_content = page.content()
+                    final_url = page.url
+                    return html_content, final_url
+                finally:
+                    context.close()
+                    browser.close()
+        except Exception as exc:
             if attempt == retries:
+                logger.error(f'Playwright failed after {retries} attempts for {url}: {exc}')
                 raise
             wait = 2 * attempt
             logger.info(
-                f'Request failed ({attempt}/{retries}) for {url}: {exc}. Retrying in {wait}s...'
+                f'Playwright request failed ({attempt}/{retries}) for {url}: {exc}. '
+                f'Retrying in {wait}s...'
             )
             time.sleep(wait)
 
@@ -114,9 +116,14 @@ def get_page_title(soup, url):
     return urlparse(url).netloc or 'output'
 
 
-def fetch_soup(session, url, timeout=20):
-    resp = fetch_response(session, 'get', url, timeout=timeout)
-    return BeautifulSoup(resp.text, 'html.parser'), resp.url, resp.text
+def fetch_soup(url, timeout=40):
+    """
+    Fetch page using Playwright and return BeautifulSoup object.
+    Timeout is in seconds (will be converted to milliseconds for Playwright).
+    """
+    timeout_ms = timeout * 1000
+    html_content, final_url = fetch_page_with_playwright(url, timeout=timeout_ms)
+    return BeautifulSoup(html_content, 'html.parser'), final_url, html_content
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +273,7 @@ def build_page_url(prefix, suffix, page_num):
     return f"{prefix}/p/{page_num}/{suffix}".rstrip('/') + '/'
 
 
-def find_total_pages(soup, html_text, prefix, suffix, session):
+def find_total_pages(soup, html_text, prefix, suffix):
     # Strategy 1: <select> with page number options
     for sel in soup.find_all('select'):
         options = sel.find_all('option')
@@ -307,12 +314,12 @@ def find_total_pages(soup, html_text, prefix, suffix, session):
             if n > 1:
                 return n
 
-    # Strategy 5: Probe by requesting pages until 404
+    # Strategy 5: Lightweight probe using requests.head
     probe = 2
     while probe <= 256:
         test_url = build_page_url(prefix, suffix, probe)
         try:
-            resp = fetch_response(session, 'head', test_url, timeout=8, allow_redirects=True)
+            resp = requests.head(test_url, timeout=8, allow_redirects=True)
             if resp.status_code >= 400:
                 return probe - 1
             probe *= 2
@@ -321,7 +328,7 @@ def find_total_pages(soup, html_text, prefix, suffix, session):
     return max_page
 
 
-def scrape_paginated(url, job_id, session, site_origin):
+def scrape_paginated(url, job_id, site_origin):
     paginated = detect_paginated(url)
     prefix, suffix, _ = paginated
 
@@ -329,7 +336,7 @@ def scrape_paginated(url, job_id, session, site_origin):
         jobs[job_id]['status'] = 'Fetching page 1 to detect structure...'
 
     page1_url = build_page_url(prefix, suffix, 1)
-    soup1, final_url, html_text = fetch_soup(session, page1_url)
+    soup1, final_url, html_text = fetch_soup(page1_url)
     page_title = get_page_title(soup1, page1_url)
 
     # Try to get ALL images from JavaScript on page 1 first (most efficient)
@@ -347,7 +354,7 @@ def scrape_paginated(url, job_id, session, site_origin):
         return sorted_images, page_title
 
     # Fallback: detect total pages and fetch each individually
-    total = find_total_pages(soup1, html_text, prefix, suffix, session)
+    total = find_total_pages(soup1, html_text, prefix, suffix)
     logger.info(f"Detected {total} pages, will fetch each individually")
 
     with jobs_lock:
@@ -361,8 +368,7 @@ def scrape_paginated(url, job_id, session, site_origin):
     def fetch_page_image(page_num):
         purl = build_page_url(prefix, suffix, page_num)
         try:
-            page_session = get_session(referer=site_origin)
-            s, final, html = fetch_soup(page_session, purl)
+            s, final, html = fetch_soup(purl)
             # Try JS extraction first on each page
             imgs = extract_images_from_scripts(html, final)
             imgs = [u for u in imgs if _looks_like_content_image(u, site_origin)]
@@ -444,14 +450,13 @@ def pick_largest_img(soup, page_url, min_dim=300):
 # Single-page gallery scraper
 # ---------------------------------------------------------------------------
 
-def scrape_single_page(url, session, site_origin):
+def scrape_single_page(url, site_origin):
     logger.info(f"Gallery scrape: {url}")
-    resp = fetch_response(session, 'get', url, timeout=15)
-    soup = BeautifulSoup(resp.text, 'html.parser')
+    soup, resp_url, resp_text = fetch_soup(url, timeout=40)
     page_title = get_page_title(soup, url)
 
     # Try JS extraction first
-    js_images = extract_images_from_scripts(resp.text, url)
+    js_images = extract_images_from_scripts(resp_text, url)
     js_images = [u for u in js_images if _looks_like_content_image(u, site_origin)]
     if js_images:
         return deduplicate_and_sort_urls(js_images), page_title
@@ -598,8 +603,6 @@ def run_job(job_id, url):
     # Use the manga page itself as referer when downloading images
     site_referer = url
 
-    session = get_session(referer=site_origin)
-
     try:
         with jobs_lock:
             jobs[job_id]['status'] = 'Analyzing URL...'
@@ -607,11 +610,11 @@ def run_job(job_id, url):
         is_paginated = detect_paginated(url) is not None
 
         if is_paginated:
-            image_urls, page_title = scrape_paginated(url, job_id, session, site_origin)
+            image_urls, page_title = scrape_paginated(url, job_id, site_origin)
         else:
             with jobs_lock:
                 jobs[job_id]['status'] = 'Scraping image URLs...'
-            image_urls, page_title = scrape_single_page(url, session, site_origin)
+            image_urls, page_title = scrape_single_page(url, site_origin)
 
         if not image_urls:
             with jobs_lock:

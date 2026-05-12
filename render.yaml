@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: image-scraper
+    runtime: python
+    pythonVersion: 3.11
+    buildCommand: bash build.sh
+    startCommand: gunicorn -w 1 -b 0.0.0.0 app:app
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: "0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
