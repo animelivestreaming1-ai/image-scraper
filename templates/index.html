@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Scraper to PDF</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Image Scraper <span>to PDF</span></h1>
+      <p class="subtitle">Ambil semua gambar dari sebuah halaman web dan jadikan satu file PDF</p>
+    </header>
+
+    <main>
+      <div class="card" id="form-card">
+        <label for="url-input">URL Halaman Web</label>
+        <div class="input-row">
+          <input
+            type="text"
+            id="url-input"
+            placeholder="https://example.com/gallery"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button id="convert-btn" onclick="startConvert()">
+            Convert to PDF
+          </button>
+        </div>
+        <p class="hint">Mendukung gambar JPG, JPEG, PNG, dan WEBP</p>
+      </div>
+
+      <div class="card hidden" id="progress-card">
+        <div class="progress-header">
+          <span class="spinner"></span>
+          <span id="status-text">Memulai...</span>
+        </div>
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progress-bar"></div>
+        </div>
+        <p class="progress-detail" id="progress-detail"></p>
+      </div>
+
+      <div class="card hidden" id="result-card">
+        <div class="result-icon">&#10003;</div>
+        <h2>PDF Berhasil Dibuat!</h2>
+        <p id="result-info"></p>
+        <div class="result-actions">
+          <a id="download-link" href="#" class="btn-download">
+            Download PDF
+          </a>
+          <button class="btn-reset" onclick="resetForm()">Convert Lagi</button>
+        </div>
+      </div>
+
+      <div class="card hidden error-card" id="error-card">
+        <div class="error-icon">&#10007;</div>
+        <h2>Terjadi Kesalahan</h2>
+        <p id="error-text"></p>
+        <button class="btn-reset" onclick="resetForm()">Coba Lagi</button>
+      </div>
+    </main>
+
+    <footer>
+      <p>Dibuat dengan Flask &bull; BeautifulSoup4 &bull; Pillow</p>
+    </footer>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
