@@ -1,11 +1,13 @@
 import os
 import re
 import json
+import time
 import uuid
 import base64
 import logging
 import requests
 import threading
+import cloudscraper
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -36,6 +38,49 @@ BROWSER_HEADERS = {
     'Connection': 'keep-alive',
 }
 
+DEFAULT_TIMEOUT = 30
+DEFAULT_RETRIES = 3
+
+
+def get_session(referer=None):
+    session = cloudscraper.create_scraper()
+    headers = dict(BROWSER_HEADERS)
+    if referer:
+        headers['Referer'] = referer
+    session.headers.update(headers)
+    return session
+
+
+def fetch_response(session, method, url, headers=None, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, allow_redirects=True, **kwargs):
+    for attempt in range(1, retries + 1):
+        try:
+            request_headers = dict(headers or {})
+            if 'Referer' in session.headers and 'Referer' not in request_headers:
+                request_headers['Referer'] = session.headers['Referer']
+            response = getattr(session, method)(
+                url,
+                headers=request_headers,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+                **kwargs,
+            )
+
+            if response.status_code in (403, 429, 500, 502, 503, 504):
+                raise requests.exceptions.HTTPError(
+                    f'Retryable status code {response.status_code}', response=response
+                )
+
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            if attempt == retries:
+                raise
+            wait = 2 * attempt
+            logger.info(
+                f'Request failed ({attempt}/{retries}) for {url}: {exc}. Retrying in {wait}s...'
+            )
+            time.sleep(wait)
+
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 jobs = {}
@@ -47,15 +92,6 @@ PAGE_PATTERN = re.compile(r'(/p/)(\d+)(/?)', re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-def get_session(referer=None):
-    s = requests.Session()
-    headers = dict(BROWSER_HEADERS)
-    if referer:
-        headers['Referer'] = referer
-    s.headers.update(headers)
-    return s
-
 
 def is_supported_image_url(url):
     path = urlparse(url).path.lower()
@@ -79,8 +115,7 @@ def get_page_title(soup, url):
 
 
 def fetch_soup(session, url, timeout=20):
-    resp = session.get(url, timeout=timeout)
-    resp.raise_for_status()
+    resp = fetch_response(session, 'get', url, timeout=timeout)
     return BeautifulSoup(resp.text, 'html.parser'), resp.url, resp.text
 
 
@@ -277,7 +312,7 @@ def find_total_pages(soup, html_text, prefix, suffix, session):
     while probe <= 256:
         test_url = build_page_url(prefix, suffix, probe)
         try:
-            resp = session.head(test_url, timeout=8, allow_redirects=True)
+            resp = fetch_response(session, 'head', test_url, timeout=8, allow_redirects=True)
             if resp.status_code >= 400:
                 return probe - 1
             probe *= 2
@@ -326,7 +361,8 @@ def scrape_paginated(url, job_id, session, site_origin):
     def fetch_page_image(page_num):
         purl = build_page_url(prefix, suffix, page_num)
         try:
-            s, final, html = fetch_soup(session, purl)
+            page_session = get_session(referer=site_origin)
+            s, final, html = fetch_soup(page_session, purl)
             # Try JS extraction first on each page
             imgs = extract_images_from_scripts(html, final)
             imgs = [u for u in imgs if _looks_like_content_image(u, site_origin)]
@@ -410,8 +446,7 @@ def pick_largest_img(soup, page_url, min_dim=300):
 
 def scrape_single_page(url, session, site_origin):
     logger.info(f"Gallery scrape: {url}")
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
+    resp = fetch_response(session, 'get', url, timeout=15)
     soup = BeautifulSoup(resp.text, 'html.parser')
     page_title = get_page_title(soup, url)
 
@@ -447,10 +482,18 @@ def download_image(img_url, index, temp_session_dir, site_referer):
     headers = dict(BROWSER_HEADERS)
     headers['Referer'] = site_referer
     headers['Accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+    session = get_session(referer=site_referer)
 
     try:
-        resp = requests.get(img_url, headers=headers, timeout=30, stream=True)
-        resp.raise_for_status()
+        resp = fetch_response(
+            session,
+            'get',
+            img_url,
+            headers=headers,
+            timeout=30,
+            stream=True,
+            allow_redirects=True,
+        )
 
         raw = resp.content
         img = Image.open(io.BytesIO(raw))
