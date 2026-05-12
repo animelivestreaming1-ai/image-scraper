@@ -49,6 +49,7 @@ def fetch_page_with_playwright(url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RET
     """
     Fetch page HTML using Playwright Chromium browser.
     Handles Cloudflare and JavaScript-rendered content.
+    Auto-scrolls to trigger lazy-loaded images.
     Returns (html_content, final_url) or raises exception after retries.
     """
     for attempt in range(1, retries + 1):
@@ -66,6 +67,25 @@ def fetch_page_with_playwright(url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RET
                 page = context.new_page()
                 try:
                     page.goto(url, wait_until='networkidle', timeout=timeout)
+                    
+                    # Auto-scroll to trigger lazy loading of images
+                    logger.info(f"Auto-scrolling page to load lazy images: {url}")
+                    for scroll_attempt in range(10):
+                        # Scroll to bottom
+                        page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                        time.sleep(0.5)
+                        
+                        # Wait for any new images to load
+                        page.wait_for_load_state('networkidle', timeout=5000)
+                        
+                        # Check if we can scroll further
+                        can_scroll = page.evaluate(
+                            'window.innerHeight + window.scrollY >= document.body.scrollHeight'
+                        )
+                        if can_scroll:
+                            logger.info(f"Reached end of page after {scroll_attempt + 1} scrolls")
+                            break
+                    
                     html_content = page.content()
                     final_url = page.url
                     return html_content, final_url
