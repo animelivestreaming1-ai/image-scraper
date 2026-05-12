@@ -487,18 +487,16 @@ def download_image(img_url, index, temp_session_dir, site_referer):
     headers = dict(BROWSER_HEADERS)
     headers['Referer'] = site_referer
     headers['Accept'] = 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
-    session = get_session(referer=site_referer)
 
     try:
-        resp = fetch_response(
-            session,
-            'get',
+        resp = requests.get(
             img_url,
             headers=headers,
             timeout=30,
             stream=True,
             allow_redirects=True,
         )
+        resp.raise_for_status()
 
         raw = resp.content
         img = Image.open(io.BytesIO(raw))
